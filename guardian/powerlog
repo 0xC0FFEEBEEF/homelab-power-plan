@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/var/lib/ups-guardian"
+MAIN_LOG="$STATE_DIR/ups-guardian.log"
+HOOK_LOG="$STATE_DIR/pwrstatd-hook.log"
+MODE="${1:-}"
+
+mkdir -p "$STATE_DIR"
+touch "$MAIN_LOG" "$HOOK_LOG"
+
+case "$MODE" in
+    -v|--verbose)
+        clear
+
+        echo "===== UPS STATUS ====="
+        pwrstat -status | grep -E 'State|Power Supply by|Battery Capacity|Remaining Runtime|Load|Last Power Event' || true
+
+        echo
+        echo "===== RECENT PWRSTATD HOOK LOG ====="
+        tail -n 80 "$HOOK_LOG" || true
+
+        echo
+        echo "===== RECENT UPS-GUARDIAN LOG ====="
+        tail -n 120 "$MAIN_LOG" || true
+
+        echo
+        echo "===== LIVE LOGS ====="
+        echo "Press Ctrl+C to stop."
+        echo
+
+        tail -F "$HOOK_LOG" "$MAIN_LOG"
+        ;;
+    -h|--help)
+        echo "Usage: powerlog [-v]"
+        echo
+        echo "powerlog     Clean live view from this moment forward"
+        echo "powerlog -v  Show recent history, then live logs"
+        ;;
+    "")
+        clear
+
+        echo "===== POWERLOG LIVE ====="
+        date -Is
+
+        echo
+        echo "===== UPS STATUS ====="
+        pwrstat -status | grep -E 'State|Power Supply by|Battery Capacity|Remaining Runtime|Load|Last Power Event' || true
+
+        echo
+        echo "===== WAITING FOR NEW POWER EVENTS ====="
+        echo "Press Ctrl+C to stop."
+        echo
+
+        tail -n 0 -F "$HOOK_LOG" "$MAIN_LOG"
+        ;;
+    *)
+        echo "Unknown option: $MODE"
+        echo "Use: powerlog or powerlog -v"
+        exit 1
+        ;;
+esac

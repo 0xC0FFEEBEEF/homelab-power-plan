@@ -1,0 +1,6 @@
+[Unit]
+Description=UPS Guardian restore watcher
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ups-guardian-restore-watch

@@ -1,0 +1,22 @@
+#!/bin/bash
+# Tell the slerm orchestrator (slerm-head) what the UPS is doing, so it never
+# powers machines ON during a power event. The head cannot reach this host's
+# dashboard (srv -> mgmt is closed at the firebox), so byteme2 pushes instead,
+# over ssh with a key that can only run ~slerm/slerm-orch/ups-push-recv on the
+# head (authorized_keys: restrict,from="192.0.2.2",command=...).
+# Runs every 60 s (slerm-ups-push.timer) and immediately from ups-guardian on
+# onbatt/online. Never blocks or fails the caller.
+STATE_DIR=/var/lib/ups-guardian
+st="$(timeout 10 pwrstat -status 2>/dev/null)"
+on_batt=false
+grep -qi "Power Supply by.*Battery" <<<"$st" && on_batt=true
+powerfail=false
+[ -f "$STATE_DIR/powerfail_active" ] && powerfail=true
+cap=$(awk -F'[.]+ *' '/Battery Capacity/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$st")
+rt=$(awk -F'[.]+ *' '/Remaining Runtime/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$st")
+disarmed_until=$(cat "$STATE_DIR/disarmed_until" 2>/dev/null | tr -cd 0-9)
+printf '{"on_battery": %s, "powerfail": %s, "battery_pct": %s, "runtime_min": %s, "disarmed_until": %s, "from": "byteme2"}\n' \
+    "$on_batt" "$powerfail" "${cap:-null}" "${rt:-null}" "${disarmed_until:-0}" |
+timeout 15 ssh -i /root/.ssh/slerm_ups_push_ed25519 -o BatchMode=yes -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=accept-new slerm@198.51.100.200 >/dev/null 2>&1
+exit 0

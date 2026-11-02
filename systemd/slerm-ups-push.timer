@@ -1,0 +1,10 @@
+[Unit]
+Description=Push UPS state to slerm every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

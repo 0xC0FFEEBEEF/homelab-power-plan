@@ -1,0 +1,11 @@
+[Unit]
+Description=Run UPS Guardian restore watcher
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=15
+AccuracySec=5
+Unit=ups-guardian-restore-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+# secrets and state stay on the servers
+*.env
+*.key
+*.pem
+*.pwd
+*.sqlite3*
+*.log
+*.pid
+# the UPS pull-test samples are data, not service logs
+!docs/ups-tests-2026-10-01/*.log
+
+# dated rollback copies
+*.bak*
+*.orig*
+*.before-*
+*.new

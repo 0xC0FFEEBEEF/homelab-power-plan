@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>byteme2 power</title>
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23000'/><path d='M18 3 7 18h8l-2 11 11-15h-8z' fill='%233ddc97'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/ui.css?v=1">
+</head>
+<body>
+<div class="edge"></div>
+<div class="sweep" id="sweep"></div>
+
+<header class="top" id="top">
+  <div class="labnav" id="labnav">
+    <button class="labnav-btn" id="labnav-btn" aria-haspopup="true" aria-expanded="false"><b>byteme2<i>·</i>power</b>
+      <svg class="labnav-caret" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5"/></svg></button>
+    <div class="labnav-menu" id="labnav-menu" role="menu" hidden>
+      <div class="labnav-head">Lab</div>
+      <a role="menuitem" class="labnav-item" href="http://198.51.100.200:8080/"><span class="labnav-name">slerm panel</span><span class="labnav-sub">cluster · jobs · AI · 198.51.100.200</span></a>
+      <a role="menuitem" class="labnav-item current" href="/" aria-current="page"><span class="labnav-name">Power</span><span class="labnav-sub">UPS · PSUs · energy · byteme2</span></a>
+      <a role="menuitem" class="labnav-item" href="http://203.0.113.250:3000/dashboard"><span class="labnav-name">Proxmox dashboard</span><span class="labnav-sub">hosts · VMs · lab telemetry · 203.0.113.250</span></a>
+      <a role="menuitem" class="labnav-item" href="http://198.51.100.10:8790/"><span class="labnav-name">Edge</span><span class="labnav-sub">Cloudflare · firewall · 198.51.100.10</span></a>
+    </div>
+  </div>
+  <nav class="tabs" id="tabs"><button data-v="dash" class="active">Dashboard</button><button data-v="settings">Settings</button><span class="ind" id="ind"></span></nav>
+  <span class="spacer"></span>
+  <div class="live"><span class="dot ok pulse" id="live-dot"></span><span class="txt" id="live-txt">Connecting</span><span class="num" id="clock"></span></div>
+</header>
+
+<div class="ibar" id="ibar"><span class="dot warn pulse" id="ib-dot"></span><b id="ib-state">On battery</b><span class="sep">·</span><span>runtime <span class="num" id="ib-rt">—</span></span><span class="sep">·</span><span id="ib-stage">guardian starting</span><span class="grow"></span><button class="ghost" id="ib-watch">Watch response</button></div>
+<div class="ring" id="ring1"></div><div class="ring r2" id="ring2"></div>
+
+<main>
+<!-- ================= DASHBOARD ================= -->
+<div class="view active" id="v-dash">
+  <section class="sec" id="hero">
+    <div class="flow-head">
+      <div>
+        <div class="eyebrow">Power source · CyberPower <span id="model">UPS</span></div>
+        <div class="state" id="state">Waiting for telemetry</div>
+        <div class="why" id="why">&nbsp;</div>
+      </div>
+    </div>
+    <div class="flow">
+      <div class="fnode util"><div class="k">Utility</div><div class="v" id="f-in">—</div><div class="s" id="f-line">&nbsp;</div></div>
+      <div class="wire w1"></div>
+      <div class="fnode"><div class="k">UPS battery</div><div class="v"><span id="f-bat">—</span><small>%</small></div><div class="s"><span id="f-rt">—</span> min runtime</div><div class="batt-bar"><i id="f-batbar" style="width:0"></i></div></div>
+      <div class="wire w2"></div>
+      <div class="fnode"><div class="k">Protected load</div><div class="v"><span id="f-load">—</span><small>W</small></div><div class="s"><span id="f-pct">—</span>% of <span id="f-rated">900</span> W · <span id="f-out">—</span> V out</div></div>
+      <div class="wire w3"></div>
+      <div class="fnode"><div class="k">Servers (BMC)</div><div class="servers-mini" id="servers-mini"></div></div>
+    </div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-h"><h2>Energy &amp; cost</h2><span class="meta" id="en-rate">—</span><div class="act"><button class="ghost" id="en-edit">Rate settings</button></div></div>
+    <form class="en-form" id="en-form" hidden></form>
+    <div class="stats" style="padding-top:16px" id="en-stats"></div>
+    <div class="chart-wrap" id="en-wrap"><svg id="en" height="190"></svg><div class="tip" id="en-tip"></div></div>
+    <div id="en-notes"></div>
+    <details class="cycles"><summary>All cycles</summary><div class="tbl-wrap"><table class="tbl" id="en-hist"></table></div></details>
+  </section>
+
+  <section class="sec">
+    <div class="sec-h"><h2>Server power supplies</h2><span class="meta">iLO · iDRAC · Intel BMC, every 15 s</span></div>
+    <div class="psus" id="psus"></div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-h"><h2 id="bl-title">Battery &amp; load</h2><span class="meta">pwrstat samples</span>
+      <div class="act"><div class="seg" id="range"><button data-s="300">Live</button><button data-s="3600" class="on">1h</button><button data-s="18000">5h</button><button data-s="43200">12h</button><button data-s="86400">24h</button><button data-s="604800">1w</button><button data-s="2592000">30d</button><button data-s="31536000">1y</button></div></div></div>
+    <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;padding-top:14px">
+      <div class="seg" id="mode"><button data-m="power" class="on">Battery &amp; load</button><button data-m="voltage">Voltage</button><button data-m="runtime">Runtime</button></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="chart-wrap" id="bl-wrap"><svg id="bl" height="240"></svg><div class="tip" id="bl-tip"></div></div>
+    <div class="chart-foot"><span id="bl-count">—</span><span>Move across the chart to inspect · click the legend to toggle</span></div>
+  </section>
+
+  <div class="split sec">
+    <section class="sec">
+      <div class="sec-h"><h2>Outage response</h2><span class="meta" id="guard-mode">standby</span></div>
+      <div class="armed">
+        <button class="switch" id="arm" role="switch" aria-checked="true" aria-label="Guardian armed"></button>
+        <div class="t"><b id="arm-t" style="color:var(--ok)">Armed</b><span id="arm-s">A power failure will shut guests down</span></div>
+        <select id="disarm-for" aria-label="Disarm window"><option value="10">10 min</option><option value="20">20 min</option><option value="30" selected>30 min</option><option value="60">60 min</option><option value="120">2 h</option><option value="240">4 h</option></select>
+      </div>
+      <div class="pipeline" id="pipe">
+        <div class="pstep"><div class="b"></div>Detect outage<small>pwrstatd event</small></div>
+        <div class="pstep"><div class="b"></div>Shed remote load<small>byteme iDRAC, deadlock BMC</small></div>
+        <div class="pstep"><div class="b"></div>Stop guests<small>parallel, deadline-aware</small></div>
+        <div class="pstep"><div class="b"></div>Cap host<small>via local iLO</small></div>
+      </div>
+      <div class="guests"><div>virtual machines<b id="g-vms">—</b></div><div>containers<b id="g-cts">—</b></div><div>host uptime<b id="g-up">—</b></div><div>host memory<b id="g-mem">—</b></div><div>peak sensor<b id="g-temp">—</b></div><div>load avg<b id="g-load">—</b></div></div>
+    </section>
+    <section class="sec">
+      <div class="sec-h"><h2>Recent events</h2><div class="act"><button class="ghost" id="ev-refresh">Refresh</button></div></div>
+      <div id="events"></div>
+    </section>
+  </div>
+
+  <section class="sec">
+    <div class="sec-h"><h2>UPS detail</h2><span class="meta mono" id="ups-model"></span></div>
+    <div class="kvgrid" id="ups-kv"></div>
+    <details class="raw"><summary>Raw pwrstat output</summary><pre id="ups-raw"></pre></details>
+  </section>
+</div>
+
+<!-- ================= SETTINGS ================= -->
+<div class="view" id="v-settings">
+  <div class="banner sec"><b>Guarded control</b>Changes apply directly to CyberPower PowerPanel. Host-shutdown controls are deliberately left out.</div>
+
+  <div class="split sec">
+    <section class="sec">
+      <div class="sec-h"><h2>PowerPanel controls</h2><span class="meta" id="lock-state">—</span>
+        <div class="act lock" id="lock" hidden><input id="token" type="password" placeholder="admin token" autocomplete="off"><button class="ghost" id="lock-btn">Unlock</button></div></div>
+      <div class="ctl"><div class="t"><b>Audible alarm</b><span>Sound the UPS alarm during a power event.</span></div><button class="switch w" id="alarm" role="switch" aria-checked="false" aria-label="Audible alarm"></button></div>
+      <div style="padding-top:14px"><b style="font-weight:500">Low-battery thresholds</b><div style="font-size:12.5px;color:var(--muted)">The guardian begins its final shutdown when either threshold is reached.</div></div>
+      <div class="slider"><div class="row"><label for="cap">Battery capacity</label><span class="num" id="cap-v">—</span></div><input class="w" type="range" id="cap" min="10" max="90" step="1"></div>
+      <div class="slider"><div class="row"><label for="rtt">Remaining runtime</label><span class="num" id="rtt-v">—</span></div><input class="w" type="range" id="rtt" min="60" max="1800" step="30"></div>
+      <div class="actions"><button class="primary w" id="save-th">Save thresholds</button><button class="ghost w" id="mute">Mute current alarm</button><button class="ghost warn w" id="selftest">Run battery self-test</button></div>
+    </section>
+    <section class="sec">
+      <div class="sec-h"><h2>PowerPanel configuration</h2><span class="meta">current state</span></div>
+      <div class="kvgrid" id="cfg-ups"></div>
+      <details class="raw"><summary>Raw pwrstat configuration</summary><pre id="cfg-raw"></pre></details>
+    </section>
+  </div>
+
+  <div class="split sec">
+    <section class="sec">
+      <div class="sec-h"><h2>Guardian policy</h2><span class="meta">read-only here, so the shutdown sequence can't be changed by accident</span></div>
+      <div class="kvgrid" id="cfg-guard"></div>
+    </section>
+    <section class="sec">
+      <div class="sec-h"><h2>Telemetry storage</h2></div>
+      <div class="kvgrid" id="cfg-store"></div>
+      <div class="note">Recent data stays local; older samples are archived to PostgreSQL and merged into long-range charts.</div>
+    </section>
+  </div>
+
+  <section class="sec">
+    <div class="sec-h"><h2>Outage tests</h2></div>
+    <div class="runs">
+      <div class="run-card dry"><span class="lbl">DRY RUN · ZERO CHANGES</span><h3>Simulate outage response</h3>
+        <p>Runs the real guardian plan while intercepting every power, guest, marker, iDRAC and BMC change.</p>
+        <ul><li>No downtime</li><li>No infrastructure changes</li><li>Safe to run any time</li></ul>
+        <button class="ghost w" id="dry-btn" style="color:var(--violet);border-color:rgba(182,155,255,.35)">Start dry run</button></div>
+      <div class="run-card real"><span class="lbl">REAL RUN · CAUSES DOWNTIME</span><h3>Test shutdown and recovery</h3>
+        <p>Sheds remote load, stops eligible Proxmox guests, applies the host power cap, then runs the normal restore sequence.</p>
+        <ul><li>Real guest and remote-host shutdown</li><li>Automatic restore attempt</li><li>Typed confirmation required</li></ul>
+        <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="ghost danger w" id="real-cfg">Configure real run</button><button class="ghost" id="replay-btn">Replay last real run</button></div>
+        <div class="confirm" id="confirm"><label for="confirm-in">Type <b class="mono">REAL OUTAGE TEST</b> to confirm</label><input id="confirm-in" autocomplete="off" spellcheck="false" style="width:190px"><button class="go-real" id="go-real" disabled>Start real run</button></div></div>
+    </div>
+  </section>
+</div>
+</main>
+
+<!-- ================= response console ================= -->
+<div class="console" id="console" aria-live="polite" role="dialog" aria-label="Outage response console">
+  <div class="c-top"><span class="c-mode" id="c-mode">OUTAGE</span><span class="el" id="c-el">00:00</span><span class="grow"></span>
+    <button class="abort" id="c-abort" hidden>Abort to recovery</button><button class="ghost" id="c-min">Minimise</button><button class="ghost" id="c-close">Close</button></div>
+  <div class="c-title" id="c-title">&nbsp;</div>
+  <div class="c-sub" id="c-sub">&nbsp;</div>
+  <div class="stages"><div class="st-line"><div class="st-fill" id="st-fill"><span class="st-comet"></span></div></div><div class="st-row" id="st-row"></div></div>
+  <div class="c-grid">
+    <div>
+      <div class="c-h">Protected load <span class="meta" id="c-wmeta">UPS output</span></div>
+      <div class="trace-wrap"><canvas id="trace"></canvas><div class="trace-big"><b id="c-w">— W</b><span id="c-wsub">&nbsp;</span></div></div>
+      <div class="stress"><span>Stress</span><div class="track"><div class="fill" id="stress" style="width:0"></div></div><span class="num" id="stress-v">0%</span></div>
+      <div class="hosts">
+        <div class="host" id="h-byteme"><span class="dot ok"></span><span>byteme<br><small>iDRAC 192.0.2.7</small></span><svg class="flat" viewBox="0 0 44 12"><path d="M0 6 H14 L17 1 L20 11 L23 6 H44"/></svg><span class="hs">ON</span><div class="hbar"><i></i></div></div>
+        <div class="host" id="h-deadlock"><span class="dot ok"></span><span>deadlock<br><small>BMC</small></span><svg class="flat" viewBox="0 0 44 12"><path d="M0 6 H14 L17 1 L20 11 L23 6 H44"/></svg><span class="hs">ON</span><div class="hbar"><i></i></div></div>
+        <div class="host" id="h-cap"><span class="dot"></span><span>byteme2 cap<br><small>local iLO</small></span><span></span><span class="hs">UNCAPPED</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="c-h">Guests <span class="meta">byteme2</span><span class="r" id="g-count">—</span></div>
+      <div class="guests-g" id="guests-g"></div>
+    </div>
+  </div>
+  <div class="c-bottom">
+    <div class="c-log"><div class="c-h">Guardian trace <span class="meta" id="log-meta">live</span></div><pre id="c-log"></pre></div>
+    <div><div class="c-h">Milestones</div><div class="ms" id="c-ms"></div></div>
+  </div>
+  <div class="finale" id="finale"><b id="fin-t">Everything checks out</b><span id="fin-s" style="color:var(--text-2);font-size:13.5px"></span>
+    <div class="sum" id="fin-sum"></div></div>
+</div>
+
+<div class="toast" id="toast" role="status"></div>
+<script src="/ui.js?v=1"></script>
+</body>
+</html>

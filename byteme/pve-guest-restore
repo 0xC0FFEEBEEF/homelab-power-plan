@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# pve-guest-restore - bring back exactly the guests that were running before
+# this host went down (UPS power-off via iDRAC, crash, or a manual reboot).
+#
+# The slerm VMs are deliberately NOT onboot: which of them should run depends
+# on what else is using the host (GamingBox shares node03's GPU), so the only
+# right answer after a reboot is "whatever was running before".
+#
+#   snapshot  record running VMs (timer, every minute, and at shutdown)
+#   restore   start them again, at boot
+set -euo pipefail
+
+STATE_DIR=/var/lib/pve-guest-restore
+LIST="$STATE_DIR/running"
+LOCK=/run/pve-guest-restore.lock
+LOG="$STATE_DIR/log"
+
+# slerm-head serves NFS to every slerm node, so it starts first and the rest
+# wait for it; a node booted without /apps comes up without slurmd.
+FIRST_VMS="300"
+NFS_HOST=198.51.100.200
+NFS_WAIT=300
+# The firebox blocks mgmt -> srv 2049, so readiness is "head sshd answers"
+# plus a settle delay for nfs-server, which starts in the same boot.
+NFS_SETTLE=20
+# A passthrough VM pins all of its RAM and this host has no swap. Starting one
+# into too little memory OOM-kills the VMs that are already running.
+MEM_MARGIN_MB=1536
+
+mkdir -p "$STATE_DIR"
+log() { echo "$(date -Is) $*" | tee -a "$LOG"; logger -t pve-guest-restore "$*"; }
+
+running_vms() { qm list | awk 'NR > 1 && $3 == "running" { print $1 }'; }
+
+snapshot() {
+    # During shutdown pve-guests is stopping everything; a snapshot taken then
+    # would record the half-stopped set. ExecStop runs before it (ordering).
+    [[ "${1:-}" != "final" ]] && systemctl is-system-running 2>/dev/null | grep -q stopping && return 0
+    exec 9>"$LOCK"; flock -n 9 || return 0      # a restore is in progress
+    local tmp; tmp="$(mktemp "$STATE_DIR/.running.XXXX")"
+    running_vms > "$tmp"
+    mv -f "$tmp" "$LIST"
+}
+
+vm_mem_mb() { qm config "$1" | awk -F': ' '$1 == "memory" { print $2 }'; }
+avail_mb() { awk '/MemAvailable/ { print int($2 / 1024) }' /proc/meminfo; }
+
+start_vm() {
+    local id="$1" need
+    qm status "$id" 2>/dev/null | grep -q "status: running" && return 0
+    if qm config "$id" | grep -qE '^onboot:[[:space:]]*1'; then
+        log "VM $id is onboot; leaving it to pve-guests"
+        return 0
+    fi
+    need=$(( $(vm_mem_mb "$id") + MEM_MARGIN_MB ))
+    if (( $(avail_mb) < need )); then
+        log "VM $id NOT started: needs ${need} MB with margin, $(avail_mb) MB available"
+        return 1
+    fi
+    log "Starting VM $id"
+    # 9>&-: the VM must not inherit the flock fd, or it holds the lock for life and
+    # every later snapshot silently skips (stale list 2026-10-01..10-04).
+    qm start "$id" 9>&- || log "VM $id failed to start"
+}
+
+restore() {
+    exec 9>"$LOCK"; flock 9
+    [[ -s "$LIST" ]] || { log "No running-guest record; nothing to restore"; return 0; }
+    local ids; ids="$(cat "$LIST")"
+    log "Restoring: $(echo $ids)"
+    local id waited=0
+    for id in $FIRST_VMS; do
+        grep -qx "$id" <<<"$ids" && start_vm "$id"
+    done
+    if grep -qx -f <(tr ' ' '\n' <<<"$FIRST_VMS") <<<"$ids"; then
+        while (( waited < NFS_WAIT )) && ! timeout 3 bash -c "</dev/tcp/$NFS_HOST/22" 2>/dev/null; do
+            sleep 5; waited=$((waited + 5))
+        done
+        sleep "$NFS_SETTLE"
+        log "NFS on $NFS_HOST: $( (( waited < NFS_WAIT )) && echo "up after ${waited}s" || echo "still down after ${waited}s, continuing")"
+    fi
+    for id in $ids; do
+        [[ " $FIRST_VMS " == *" $id "* ]] && continue
+        start_vm "$id" || true
+        sleep 5     # let pinning settle before measuring memory again
+    done
+    log "Restore finished"
+}
+
+case "${1:-}" in
+    snapshot) snapshot "${2:-}" ;;
+    restore)  restore ;;
+    *) echo "usage: $0 snapshot [final]|restore"; exit 1 ;;
+esac

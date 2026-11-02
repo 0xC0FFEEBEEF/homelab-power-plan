@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Read-only PSU / power telemetry from the local BMC as one JSON document (Dell iDRAC or HP iLO).
+
+Used by the ByteMe2 power dashboard: locally on byteme2, and on byteme through a forced-command ssh key
+(authorized_keys: command="/usr/local/bin/psu-telemetry",restrict). It only ever READS sensors.
+
+  psu-telemetry --lan HOST USER PASSFILE NAME   read a BMC over IPMI-over-LAN instead (deadlock's Intel BMC,
+                                                OPERATOR user; the firebox "IPMI" policy must allow it)
+"""
+import json, re, subprocess, sys, time
+from pathlib import Path
+
+LAN = sys.argv[1:2] == ["--lan"]
+PREFIX = ("-I", "lanplus", "-H", sys.argv[2], "-U", sys.argv[3], "-f", sys.argv[4], "-L", "OPERATOR") if LAN else ()
+
+
+def ipmi(*args, timeout=15, retry=()):
+    try:
+        p = subprocess.run(("ipmitool",) + retry + PREFIX + args, text=True, capture_output=True, timeout=timeout)
+        return p.stdout
+    except Exception:
+        return ""
+
+
+def chassis():
+    """'on' / 'off' from the BMC, or None when it does not answer. Asked FIRST and
+    with a short retry, so an unreachable BMC costs ~5 s instead of 5 x 15 s."""
+    t = ipmi("chassis", "power", "status", timeout=12, retry=("-N", "2", "-R", "1") if LAN else ()).lower()
+    return "on" if "is on" in t else "off" if "is off" in t else None
+
+
+def rows(text):
+    """Compact sdr lines: 'Name | 6Ah | ok | 10.1 | 2.20 Amps' -> dicts."""
+    out = []
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) == 5:
+            out.append({"name": parts[0], "status": parts[2], "entity": parts[3], "reading": parts[4]})
+    return out
+
+
+def num(s):
+    m = re.search(r"-?\d+(?:\.\d+)?", s or "")
+    return float(m.group()) if m else None
+
+
+def dcmi():
+    t = ipmi("dcmi", "power", "reading")
+    pick = lambda label: num((re.search(label + r":\s*([\d.]+)", t) or [None, None])[1])
+    return {"now_w": pick("Instantaneous power reading"), "min_w": pick("Minimum during sampling period"),
+            "max_w": pick("Maximum during sampling period"), "avg_w": pick("Average power reading over sample period")}
+
+
+power_state = chassis()
+if LAN and power_state is None:
+    # BMC silent (unplugged, network, firebox). Say so explicitly: an empty
+    # document used to look like a successful reading with no sensors.
+    print(json.dumps({"host": sys.argv[5], "ts": int(time.time()), "bmc": "unreachable"}, separators=(",", ":")))
+    sys.exit(0)
+
+if LAN:
+    fru = ipmi("fru", "print", "0")
+    field = lambda k: (re.search(r"^\s*" + k + r"\s*:\s*(.+)$", fru, re.M) or [None, ""])[1].strip()
+    vendor, model, host = field("Product Manufacturer") or field("Board Mfg"), field("Product Name") or field("Board Product"), sys.argv[5]
+else:
+    vendor = Path("/sys/class/dmi/id/sys_vendor").read_text().strip()
+    model = Path("/sys/class/dmi/id/product_name").read_text().strip()
+    host = Path("/etc/hostname").read_text().strip()
+doc = {"host": host, "vendor": vendor, "model": model, "bmc": "ok", "chassis": power_state,
+       "ts": int(time.time()), "psus": [], "redundancy": None, "power": dcmi()}
+
+psu_rows = rows(ipmi("sdr", "type", "Power Supply"))
+# Intel boards (S1600JP on deadlock) keep redundancy under "Power Unit" instead.
+for r in psu_rows + rows(ipmi("sdr", "type", "Power Unit")):
+    if "redund" in r["name"].lower() or r["name"].lower() == "power supplies":
+        doc["redundancy"] = r["reading"]
+
+if vendor.lower().startswith("dell"):
+    cur = {r["entity"]: num(r["reading"]) for r in rows(ipmi("sdr", "type", "Current")) if r["name"].startswith("Current")}
+    vol = {r["entity"]: num(r["reading"]) for r in rows(ipmi("sdr", "type", "Voltage")) if r["name"].startswith("Voltage")}
+    status = {r["entity"]: r for r in psu_rows if r["name"] == "Status"}
+    for i, ent in enumerate(sorted(set(cur) | set(vol)), 1):
+        a, v = cur.get(ent), vol.get(ent)
+        doc["psus"].append({"name": "PSU %d" % i, "amps": a, "volts": v,
+                            "watts": round(a * v) if a is not None and v is not None else None,
+                            "ok": status.get(ent, {}).get("status", "ok") == "ok",
+                            "state": status.get(ent, {}).get("reading")})
+    pc = [r for r in rows(ipmi("sdr", "type", "Current")) if r["name"] == "Pwr Consumption"]
+    pm = ipmi("delloem", "powermonitor")
+    def stat(title, field):
+        block = pm.split("Statistic      : " + title)
+        if len(block) < 2:
+            return None
+        m = re.search(field + r"\s*:\s*([^\n]*?)(?=[A-Z][a-z]+ [A-Z][a-z]+\s+:|\n|$)", block[1])
+        return m.group(1).strip() if m else None
+    doc["energy"] = {"kwh": num(stat("Cumulative Energy Consumption", "Reading")),
+                     "since": stat("Cumulative Energy Consumption", "Start Time"),
+                     "peak_w": num(stat("System Peak Power", "Peak Reading")),
+                     "peak_w_at": stat("System Peak Power", "Peak Time"),
+                     "peak_a": num(stat("System Peak Amperage", "Peak Reading")),
+                     "peak_a_at": stat("System Peak Amperage", "Peak Time")}
+elif vendor.lower().startswith("intel"):
+    # Intel BMC: no DCMI power reading; per-PSU "PSn Power In" / "Curr Out %" / "Temperature" in the full sdr list.
+    full = {}
+    for line in ipmi("sdr").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) == 3:
+            full[parts[0]] = parts
+    for n in sorted({m.group(1) for k in full for m in [re.match(r"PS(\d+) ", k)] if m}):
+        w, st = full.get("PS%s Power In" % n), full.get("PS%s Status" % n)
+        if not w:
+            continue
+        pct, temp = full.get("PS%s Curr Out %%" % n), full.get("PS%s Temperature" % n)
+        doc["psus"].append({"name": "PSU " + n, "watts": num(w[1]), "amps": None, "volts": None,
+                            "load_pct": num(pct[1]) if pct else None, "temp_c": num(temp[1]) if temp else None,
+                            "ok": w[2] == "ok" and (not st or st[2] == "ok"), "state": None})
+    if doc["power"]["now_w"] is None and doc["psus"]:
+        doc["power"]["now_w"] = sum(x["watts"] or 0 for x in doc["psus"])
+else:
+    for r in psu_rows:
+        m = re.match(r"Power Supply (\d+)$", r["name"])
+        if m:
+            doc["psus"].append({"name": "PSU " + m.group(1), "watts": num(r["reading"]), "amps": None, "volts": None,
+                                "ok": r["status"] == "ok", "state": r["reading"].split(",", 1)[-1].strip()})
+
+if power_state == "off":
+    # Host powered off, BMC on standby: PSU sensors may read standby watts or
+    # nothing at all. A missing reading is 0 W here, not unknown, so the energy
+    # and surge totals do not drop out while the box is simply off.
+    for x in doc["psus"]:
+        if x.get("watts") is None:
+            x["watts"] = 0.0
+            x["ok"] = True      # "no reading" (status ns) while off is not a fault
+        x["state"] = "standby"
+    if doc["power"]["now_w"] is None:
+        doc["power"]["now_w"] = sum(x["watts"] or 0 for x in doc["psus"])
+
+print(json.dumps(doc, separators=(",", ":")))

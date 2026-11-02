@@ -1,0 +1,864 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ups-guardian - bring the estate down cleanly before the UPS runs out.
+#
+# Budget: the UPS holds ~7 min (420 s) at current load. Everything below is
+# sized so the worst case finishes well inside that, and a hard deadline
+# force-stops whatever is left rather than running the battery flat.
+
+STATE_DIR="/var/lib/ups-guardian"
+LOCK_FILE="/run/ups-guardian.lock"
+LOG_FILE="$STATE_DIR/ups-guardian.log"
+LOG_MAX_BYTES="$((16 * 1024 * 1024))"
+
+REMOTE_HOST="192.0.2.4"
+
+# Literal IP on purpose: during a power event DNS may be down, and the whole
+# point of contacting the iDRAC is to shed load. idrac resolves here.
+IDRAC_HOST="192.0.2.7"
+IDRAC_USER="root"
+IDRAC_PASS_FILE="/root/.idrac_192_0_2_4"
+
+# The network-facing iLO (ilo / 198.51.100.17) does not answer IPMI.
+# The local BMC is reachable through the in-band KCS interface, so use that.
+ILO_INTERFACE="open"
+ILO_PASS_FILE="/root/.ilo_guardian"   # password of the iLO user "guardian", mode 0600
+# This HP DL360 Gen9 iLO4 does NOT implement the DCMI Set Power Limit command
+# in-band (returns completion code 0x80 for any value), so the power cap is set
+# through HP's own in-band tool, hponcfg (RIBCL SET_POWER_CAP), instead. The
+# server's physical floor is ~145 W. Measured 2026-10-01: iLO accepts 107 W and
+# answers "The value specified is invalid" for 106 W and below (70/90 W too),
+# so 107 W is the tightest, maximally-throttling cap this hardware takes.
+HPONCFG_BIN="/usr/sbin/hponcfg"
+LOCAL_ILO_POWER_CAP_WATTS="107"
+
+# deadlock (slerm-node05) is bare metal with one PSU on the battery side and no
+# SSH key from here, so it is driven through its Intel BMC over IPMI-over-LAN
+# (user byteme2, OPERATOR). Literal IP for the same DNS reason as the iDRAC.
+DEADLOCK_BMC="198.51.100.18"
+DEADLOCK_BMC_USER="byteme2"
+DEADLOCK_BMC_PASS_FILE="/root/.bmc_deadlock"
+DEADLOCK_POWEROFF_CONFIRM_TIMEOUT="150"
+# deadlock mounts /apps and /home from slerm-head, a VM on byteme. Booting it
+# before that NFS server answers leaves slurmd stopped and slerm unable to log
+# in, so the power-on waits for it, then goes ahead anyway after this long.
+SLERM_NFS_HOST="198.51.100.200"
+DEADLOCK_NFS_WAIT_SECONDS="900"
+
+PROTECTED_LXC="132"
+PROTECTED_VMS="201"
+
+# Total wall-clock we allow ourselves from the first power-fail action until
+# everything must be stopped, one way or another.
+SHUTDOWN_DEADLINE_SECONDS="240"
+
+# Grace given to a guest that we believe can shut itself down cleanly.
+VM_SHUTDOWN_TIMEOUT="60"
+CT_SHUTDOWN_TIMEOUT="45"
+# Grace given to a guest whose qemu-guest-agent does not answer. ACPI may still
+# work, but we are not going to wait long to find out.
+VM_NOAGENT_TIMEOUT="25"
+AGENT_PING_TIMEOUT="5"
+# Per-VM grace (vmid:seconds) for guests that need longer than the above.
+# Wazuh (103) was force-killed at 60 s on 09-19 and 10-01, and the 10-01 kill
+# left its root filesystem needing a manual fsck. Must fit inside
+# SHUTDOWN_DEADLINE_SECONDS after REMOTE_SHUTDOWN_DELAY.
+VM_SHUTDOWN_TIMEOUT_OVERRIDES="103:180"
+
+REMOTE_SHUTDOWN_DELAY="15"
+REMOTE_POWEROFF_CONFIRM_TIMEOUT="90"
+RECENT_COMMAND_WAIT_SECONDS="150"
+
+IPMI_TIMEOUT="15"
+RESTORE_MAX_ATTEMPTS="20"
+
+# A lowbatt that arrives while onbatt holds the lock must wait for it, not be
+# dropped: on 2026-09-19 the old 30 s wait expired and lowbatt never ran.
+# onbatt is bounded by SHUTDOWN_DEADLINE_SECONDS plus a few IPMI timeouts.
+LOWBATT_LOCK_WAIT="300"
+# pwrstatd fires lowbatt on its runtime estimate, which dips to 5 min while the
+# shed itself is drawing hard (09-19: 33 s into the outage at ~95 %). So once
+# the lock is ours, re-read the UPS against pwrstatd's own thresholds and halt
+# only if it is still low; the restore watcher re-checks every 15 s after that.
+PWRSTATD_CONF="/etc/pwrstatd.conf"
+# Below this many minutes lowbatt stops waiting for byteme to finish powering
+# off and halts on the reading it has.
+LOWBATT_CRITICAL_RUNTIME_MIN="2"
+
+POWERFAIL_MARKER="$STATE_DIR/powerfail_active"
+REMOTE_SHUTDOWN_REQUESTED="$STATE_DIR/remote_shutdown_requested"
+REMOTE_SHUTDOWN_SUCCESS="$STATE_DIR/remote_shutdown_success"
+REMOTE_SHUTDOWN_EPOCH="$STATE_DIR/remote_shutdown_epoch"
+RESTORE_ATTEMPTS_FILE="$STATE_DIR/restore_attempts"
+QEMU_STATE_FILE="$STATE_DIR/qemu_vms"
+LXC_STATE_FILE="$STATE_DIR/lxc_cts"
+# Maintenance disarm (dashboard switch): epoch until which a power failure is
+# ignored, e.g. while the UPS is unplugged to insert a meter. If one is ignored,
+# ONBATT_SUPPRESSED lets the restore watcher run onbatt when the window ends
+# with the UPS still on battery. Low battery is never disarmed.
+DISARMED_UNTIL_FILE="$STATE_DIR/disarmed_until"
+ONBATT_SUPPRESSED="$STATE_DIR/onbatt_suppressed"
+# Set only when WE turned deadlock off, so a box the user had powered down
+# stays down after the outage.
+DEADLOCK_SHUTDOWN_SUCCESS="$STATE_DIR/deadlock_shutdown_success"
+DEADLOCK_RESTORE_PENDING="$STATE_DIR/deadlock_restore_pending"
+
+DRY_RUN="${UPS_GUARDIAN_DRY_RUN:-0}"
+REAL_TEST="${UPS_GUARDIAN_REAL_TEST:-0}"
+REAL_TEST_ABORT_FILE="/run/ups-guardian-realtest-abort"
+# Silence IPMI chatter on real runs, but keep dry-run notices visible.
+if [[ "$DRY_RUN" == "1" ]]; then IPMI_QUIET="/dev/stdout"; else IPMI_QUIET="/dev/null"; fi
+
+mkdir -p "$STATE_DIR"
+
+DRY_RUN_TEMP_STATE=0
+cleanup_dry_run_state() {
+    if [[ "${DRY_RUN_TEMP_STATE:-0}" == "1" ]]; then
+        rm -f "$QEMU_STATE_FILE" "$LXC_STATE_FILE"
+    fi
+}
+trap cleanup_dry_run_state EXIT
+
+log_msg() {
+    local msg
+    msg="$(date -Is) $*"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "$msg"
+        return 0
+    fi
+    # A guarded real recovery test needs the same live trace as a dry run.
+    # Keep the durable log below, and mirror each line to the dashboard job.
+    [[ "$REAL_TEST" == "1" ]] && echo "$msg"
+    echo "$msg" >> "$LOG_FILE"
+    logger -t ups-guardian "$*"
+}
+
+rotate_log_if_needed() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    [[ -f "$LOG_FILE" ]] || return 0
+    local size
+    size="$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)"
+    if (( size > LOG_MAX_BYTES )); then
+        mv -f "$LOG_FILE" "$LOG_FILE.1"
+        : > "$LOG_FILE"
+    fi
+}
+
+# run <description> <command...>  - honours dry-run
+run() {
+    local desc="$1"; shift
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "$(date -Is) [DRY-RUN] would run: $*   # $desc"
+        return 0
+    fi
+    "$@"
+}
+
+deadline_reached() {
+    (( SECONDS >= DEADLINE_AT ))
+}
+
+seconds_left() {
+    local left=$((DEADLINE_AT - SECONDS))
+    (( left < 0 )) && left=0
+    echo "$left"
+}
+
+power_is_utility() {
+    pwrstat -status 2>/dev/null | grep -qi "Power Supply by.*Utility Power"
+}
+
+# Prints utility|low|ok|unknown plus a short reading. "low" uses pwrstatd's
+# lowbatt-threshold (%) and runtime-threshold (s), which the dashboard can change.
+battery_state() {
+    local st cap rt cap_min rt_min
+    cap_min="$(awk -F' *= *' '$1=="lowbatt-threshold"{print $2}' "$PWRSTATD_CONF" 2>/dev/null)"
+    rt_min="$(awk -F' *= *' '$1=="runtime-threshold"{print $2}' "$PWRSTATD_CONF" 2>/dev/null)"
+    [[ "$cap_min" =~ ^[0-9]+$ ]] || cap_min=35
+    [[ "$rt_min" =~ ^[0-9]+$ ]] || rt_min=300
+    st="$(timeout 10 pwrstat -status 2>/dev/null)" || { echo "unknown (pwrstat failed)"; return 0; }
+    cap="$(awk -F'[.]+ *' '/Battery Capacity/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$st")"
+    rt="$(awk -F'[.]+ *' '/Remaining Runtime/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$st")"
+    if grep -qi "Power Supply by.*Utility Power" <<<"$st"; then
+        echo "utility (${cap:-?} %)"
+    elif ! grep -qi "Power Supply by.*Battery" <<<"$st" || [[ ! "$cap" =~ ^[0-9]+$ || ! "$rt" =~ ^[0-9]+$ ]]; then
+        echo "unknown ($(awk -F'[.]+ *' '/State/ {print $2}' <<<"$st"))"
+    elif (( cap <= cap_min || rt * 60 <= rt_min )); then
+        echo "low (${cap} %, ${rt} min; line ${cap_min} % / ${rt_min} s)"
+    else
+        echo "ok (${cap} %, ${rt} min; line ${cap_min} % / ${rt_min} s)"
+    fi
+}
+
+# ---------------------------------------------------------------- IPMI ------
+
+ipmi_idrac() {
+    if [[ ! -f "$IDRAC_PASS_FILE" ]]; then
+        log_msg "Missing iDRAC password file: $IDRAC_PASS_FILE"
+        return 1
+    fi
+    # In dry-run, read-only queries still execute (so the run is meaningful);
+    # anything that changes power state is only printed.
+    if [[ "$DRY_RUN" == "1" ]]; then
+        case "${*: -1}" in
+            status|reading|get_limit) : ;;
+            *) echo "$(date -Is) [DRY-RUN] would run: ipmitool -H $IDRAC_HOST $*"; return 0 ;;
+        esac
+    fi
+    IPMI_PASSWORD="$(cat "$IDRAC_PASS_FILE")" \
+        timeout "$IPMI_TIMEOUT" ipmitool -I lanplus -N 3 -R 2 \
+        -H "$IDRAC_HOST" -U "$IDRAC_USER" -E "$@"
+}
+
+ipmi_local() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        case "${*: -1}" in
+            status|reading|get_limit) : ;;
+            *) echo "$(date -Is) [DRY-RUN] would run: ipmitool -I $ILO_INTERFACE $*"; return 0 ;;
+        esac
+    fi
+    timeout "$IPMI_TIMEOUT" ipmitool -I "$ILO_INTERFACE" "$@"
+}
+
+ipmi_deadlock() {
+    if [[ ! -f "$DEADLOCK_BMC_PASS_FILE" ]]; then
+        log_msg "Missing deadlock BMC password file: $DEADLOCK_BMC_PASS_FILE"
+        return 1
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        case "${*: -1}" in
+            status) : ;;
+            *) echo "$(date -Is) [DRY-RUN] would run: ipmitool -H $DEADLOCK_BMC $*"; return 0 ;;
+        esac
+    fi
+    timeout "$IPMI_TIMEOUT" ipmitool -I lanplus -N 3 -R 2 -H "$DEADLOCK_BMC" \
+        -U "$DEADLOCK_BMC_USER" -f "$DEADLOCK_BMC_PASS_FILE" -L OPERATOR "$@"
+}
+
+deadlock_power_status() {
+    ipmi_deadlock chassis power status 2>/dev/null || true
+}
+
+deadlock_is_off() { deadlock_power_status | grep -qi "is off"; }
+deadlock_is_on()  { deadlock_power_status | grep -qi "is on"; }
+
+idrac_power_status() {
+    ipmi_idrac chassis power status 2>/dev/null || true
+}
+
+idrac_is_off() { idrac_power_status | grep -qi "is off"; }
+idrac_is_on()  { idrac_power_status | grep -qi "is on"; }
+
+# Apply a power cap (watts), or 0 to turn the cap off, via in-band hponcfg
+# (RIBCL SET_POWER_CAP). Honours dry-run. Returns non-zero on any failure.
+ilo_powercap_set() {
+    local watts="$1" desc="$2"
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "$(date -Is) [DRY-RUN] would run: hponcfg SET_POWER_CAP POWER_CAP=$watts   # $desc"
+        return 0
+    fi
+    [[ -x "$HPONCFG_BIN" ]] || { log_msg "hponcfg not available at $HPONCFG_BIN"; return 1; }
+    local xml out rc
+    xml="$(mktemp)"
+    printf '<RIBCL VERSION="2.0"><LOGIN USER_LOGIN="guardian" PASSWORD="%s"><SERVER_INFO MODE="write"><SET_POWER_CAP POWER_CAP="%s"/></SERVER_INFO></LOGIN></RIBCL>\n' "$(cat "$ILO_PASS_FILE")" "$watts" > "$xml"
+    out="$(timeout "$IPMI_TIMEOUT" "$HPONCFG_BIN" -f "$xml" 2>&1)"; rc=$?
+    rm -f "$xml"
+    if ! { (( rc == 0 )) && grep -q "Script succeeded" <<<"$out"; }; then
+        # Keep iLO's own reason; 10-01 failed with no clue why.
+        log_msg "hponcfg rc=$rc: $(grep -oE "MESSAGE='[^']*'|[Ee]rror[^<]*" <<<"$out" | grep -v "No error" | sort -u | tr '\n' ' ' | cut -c1-300)"
+        return 1
+    fi
+    return 0
+}
+
+enable_local_power_cap() {
+    log_msg "Enabling local power cap at ${LOCAL_ILO_POWER_CAP_WATTS}W via in-band iLO (hponcfg)"
+    # Retried like the release: on 10-01 the first attempt failed while the
+    # release four minutes later went through first time.
+    local attempt
+    for attempt in 1 2 3; do
+        if ilo_powercap_set "$LOCAL_ILO_POWER_CAP_WATTS" "enable power cap"; then
+            log_msg "Local power cap active"
+            return 0
+        fi
+        log_msg "Power cap enable failed on attempt $attempt"
+        sleep 2
+    done
+    log_msg "Could not set local power cap (non-fatal)"
+    return 1
+}
+
+disable_local_power_cap() {
+    log_msg "Disabling local power cap"
+    local attempt
+    for attempt in 1 2 3; do
+        if ilo_powercap_set 0 "disable power cap"; then
+            log_msg "Local power cap deactivated"
+            return 0
+        fi
+        log_msg "Power cap deactivate failed on attempt $attempt"
+        sleep 2
+    done
+    # A BMC that will not talk to us must never wedge the restore state machine.
+    log_msg "Giving up on power cap deactivation (non-fatal, continuing restore)"
+    return 1
+}
+
+# -------------------------------------------------------------- guests ------
+
+guest_is_protected() {
+    local id="$1" list="$2"
+    [[ " $list " == *" $id "* ]]
+}
+
+record_running_local_guests() {
+    # A dry run must not leave real state behind for a later live event to consume.
+    if [[ "$DRY_RUN" == "1" ]]; then
+        QEMU_STATE_FILE="$(mktemp)"; LXC_STATE_FILE="$(mktemp)"
+        DRY_RUN_TEMP_STATE=1
+    fi
+    if [[ ! -f "$QEMU_STATE_FILE" || ! -s "$QEMU_STATE_FILE" ]]; then
+        qm list | awk -v prot="$PROTECTED_VMS" \
+            'BEGIN { split(prot, a, /[ ,]+/); for (i in a) skip[a[i]]=1 }
+             NR > 1 && $3 == "running" && !($1 in skip) { print $1 }' > "$QEMU_STATE_FILE"
+    fi
+    if [[ ! -f "$LXC_STATE_FILE" || ! -s "$LXC_STATE_FILE" ]]; then
+        pct list | awk -v prot="$PROTECTED_LXC" \
+            'BEGIN { split(prot, a, /[ ,]+/); for (i in a) skip[a[i]]=1 }
+             NR > 1 && $2 == "running" && !($1 in skip) { print $1 }' > "$LXC_STATE_FILE"
+    fi
+}
+
+# Probe the agent at runtime instead of trusting a hand-maintained list.
+vm_agent_responds() {
+    local vmid="$1"
+    grep -qE '^agent:[[:space:]]*(1|enabled=1)' <(qm config "$vmid" --current 1 2>/dev/null) || return 1
+    timeout "$AGENT_PING_TIMEOUT" qm agent "$vmid" ping >/dev/null 2>&1
+}
+
+shutdown_one_vm() {
+    local vmid="$1" grace
+    qm status "$vmid" 2>/dev/null | grep -q "status: running" || return 0
+    if vm_agent_responds "$vmid"; then
+        grace="$VM_SHUTDOWN_TIMEOUT"
+        log_msg "VM $vmid: agent responding, shutdown with ${grace}s grace then force"
+    else
+        grace="$VM_NOAGENT_TIMEOUT"
+        log_msg "VM $vmid: NO agent response, shutdown with ${grace}s grace then force"
+    fi
+    local o
+    for o in $VM_SHUTDOWN_TIMEOUT_OVERRIDES; do
+        if [[ "${o%%:*}" == "$vmid" ]]; then
+            grace="${o##*:}"
+            log_msg "VM $vmid: grace overridden to ${grace}s"
+        fi
+    done
+    run "shutdown VM $vmid" qm shutdown "$vmid" --timeout "$grace" --forceStop 1 || {
+        log_msg "VM $vmid: shutdown returned non-zero, issuing hard stop"
+        run "stop VM $vmid" qm stop "$vmid" --skiplock 1 || true
+    }
+    log_msg "VM $vmid: stopped"
+}
+
+shutdown_one_ct() {
+    local ctid="$1"
+    pct status "$ctid" 2>/dev/null | grep -q "status: running" || return 0
+    log_msg "CT $ctid: shutdown with ${CT_SHUTDOWN_TIMEOUT}s grace then force"
+    run "shutdown CT $ctid" pct shutdown "$ctid" --timeout "$CT_SHUTDOWN_TIMEOUT" --forceStop 1 || {
+        log_msg "CT $ctid: shutdown returned non-zero, issuing hard stop"
+        run "stop CT $ctid" pct stop "$ctid" --skiplock 1 || true
+    }
+    log_msg "CT $ctid: stopped"
+}
+
+# All guests go down concurrently. Serial shutdown at 120 s each could not
+# finish 13 guests inside the battery budget.
+shutdown_local_guests() {
+    record_running_local_guests
+    local pids=() vmid ctid
+
+    while read -r vmid; do
+        [[ -n "$vmid" ]] || continue
+        shutdown_one_vm "$vmid" &
+        pids+=("$!")
+    done < "$QEMU_STATE_FILE"
+
+    while read -r ctid; do
+        [[ -n "$ctid" ]] || continue
+        shutdown_one_ct "$ctid" &
+        pids+=("$!")
+    done < "$LXC_STATE_FILE"
+
+    log_msg "Dispatched ${#pids[@]} guest shutdowns in parallel, $(seconds_left)s of budget left"
+    wait_with_deadline "${pids[@]}"
+    log_msg "Parallel guest shutdown finished, $(seconds_left)s of budget left"
+}
+
+wait_with_deadline() {
+    local pids=("$@") pid alive
+    while :; do
+        if [[ "$REAL_TEST" == "1" && -f "$REAL_TEST_ABORT_FILE" ]]; then
+            log_msg "REAL RECOVERY TEST: abort-to-recovery requested; stopping remaining guest shutdown waits"
+            for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+            return 0
+        fi
+        alive=0
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        (( alive == 0 )) && return 0
+        if deadline_reached; then
+            log_msg "Deadline hit with shutdowns still running; escalating to force-stop"
+            for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+            force_stop_everything
+            return 0
+        fi
+        sleep 2
+    done
+}
+
+force_stop_everything() {
+    # One qm list + one pct list: per-guest status calls took 11-21 s apiece
+    # under the power cap on 10-01 and stalled lowbatt for minutes.
+    local vmid ctid running_vms running_cts
+    running_vms=" $(qm list 2>/dev/null | awk 'NR > 1 && $3 == "running" { printf "%s ", $1 }')"
+    running_cts=" $(pct list 2>/dev/null | awk 'NR > 1 && $2 == "running" { printf "%s ", $1 }')"
+    while read -r vmid; do
+        [[ -n "$vmid" && "$running_vms" == *" $vmid "* ]] || continue
+        log_msg "Force-stopping VM $vmid (deadline)"
+        run "force stop VM $vmid" qm stop "$vmid" --skiplock 1 || true
+    done < "$QEMU_STATE_FILE"
+    while read -r ctid; do
+        [[ -n "$ctid" && "$running_cts" == *" $ctid "* ]] || continue
+        log_msg "Force-stopping CT $ctid (deadline)"
+        run "force stop CT $ctid" pct stop "$ctid" --skiplock 1 || true
+    done < "$LXC_STATE_FILE"
+}
+
+shutdown_protected_guests() {
+    local id
+    for id in $PROTECTED_VMS; do
+        if qm status "$id" 2>/dev/null | grep -q "status: running"; then
+            log_msg "Protected VM $id: final shutdown"
+            run "shutdown protected VM $id" qm shutdown "$id" --timeout 30 --forceStop 1 || true
+        fi
+    done
+    for id in $PROTECTED_LXC; do
+        if pct status "$id" 2>/dev/null | grep -q "status: running"; then
+            log_msg "Protected CT $id: final shutdown"
+            run "shutdown protected CT $id" pct shutdown "$id" --timeout 20 --forceStop 1 || true
+        fi
+    done
+}
+
+start_local_guests() {
+    local ctid vmid
+    if [[ -s "$LXC_STATE_FILE" ]]; then
+        while read -r ctid; do
+            [[ -n "$ctid" ]] || continue
+            if ! pct status "$ctid" 2>/dev/null | grep -q "status: running"; then
+                log_msg "Starting LXC $ctid"
+                run "start CT $ctid" pct start "$ctid" || true
+            fi
+        done < "$LXC_STATE_FILE"
+    fi
+    if [[ -s "$QEMU_STATE_FILE" ]]; then
+        while read -r vmid; do
+            [[ -n "$vmid" ]] || continue
+            if ! qm status "$vmid" 2>/dev/null | grep -q "status: running"; then
+                log_msg "Starting VM $vmid"
+                run "start VM $vmid" qm start "$vmid" || true
+            fi
+        done < "$QEMU_STATE_FILE"
+    fi
+    run "clear guest state files" rm -f "$QEMU_STATE_FILE" "$LXC_STATE_FILE"
+}
+
+# -------------------------------------------------------------- remote ------
+
+# Fire-and-forget: the remote node's own shutdown must not consume our budget.
+shutdown_remote_host_async() {
+    if [[ -f "$REMOTE_SHUTDOWN_SUCCESS" ]]; then
+        log_msg "$REMOTE_HOST already marked powered down"
+        return 0
+    fi
+    if [[ -f "$REMOTE_SHUTDOWN_REQUESTED" ]]; then
+        log_msg "$REMOTE_HOST power-down already requested"
+        return 0
+    fi
+    run "record remote shutdown epoch" bash -c "date +%s > '$REMOTE_SHUTDOWN_EPOCH'"
+    run "mark remote shutdown requested" touch "$REMOTE_SHUTDOWN_REQUESTED"
+
+    (
+        log_msg "Sending iDRAC soft power-off to $REMOTE_HOST via $IDRAC_HOST"
+        ipmi_idrac chassis power soft >"$IPMI_QUIET" 2>&1 || true
+        if [[ "$DRY_RUN" == "1" ]]; then
+            log_msg "[DRY-RUN] would now poll $IDRAC_HOST for up to ${REMOTE_POWEROFF_CONFIRM_TIMEOUT}s, then hard power-off if unconfirmed"
+            exit 0
+        fi
+        local end=$((SECONDS + REMOTE_POWEROFF_CONFIRM_TIMEOUT))
+        while (( SECONDS < end )); do
+            if idrac_is_off; then
+                run "mark remote shutdown success" touch "$REMOTE_SHUTDOWN_SUCCESS"
+                log_msg "$IDRAC_HOST confirmed $REMOTE_HOST powered off"
+                exit 0
+            fi
+            sleep 5
+        done
+        log_msg "Soft power-off not confirmed; sending hard power off to $REMOTE_HOST"
+        ipmi_idrac chassis power off >"$IPMI_QUIET" 2>&1 || true
+        sleep 10
+        if idrac_is_off; then
+            run "mark remote shutdown success" touch "$REMOTE_SHUTDOWN_SUCCESS"
+            log_msg "$IDRAC_HOST confirmed forced power-off of $REMOTE_HOST"
+        else
+            log_msg "$IDRAC_HOST could not confirm $REMOTE_HOST power-off"
+        fi
+    ) &
+    log_msg "Remote power-off dispatched in background (pid $!), not blocking local shutdown"
+}
+
+restore_remote_host() {
+    if [[ ! -f "$REMOTE_SHUTDOWN_SUCCESS" ]]; then
+        log_msg "$REMOTE_HOST was not confirmed shut down by us; skipping remote power-on"
+        return 0
+    fi
+    if [[ -f "$REMOTE_SHUTDOWN_EPOCH" ]]; then
+        local then_epoch now_epoch elapsed remaining
+        then_epoch="$(cat "$REMOTE_SHUTDOWN_EPOCH")"
+        now_epoch="$(date +%s)"
+        elapsed=$((now_epoch - then_epoch))
+        if (( elapsed < RECENT_COMMAND_WAIT_SECONDS )); then
+            remaining=$((RECENT_COMMAND_WAIT_SECONDS - elapsed))
+            log_msg "Waiting ${remaining}s before powering $REMOTE_HOST back on"
+            sleep "$remaining"
+        fi
+    fi
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if idrac_is_on; then
+            log_msg "$REMOTE_HOST is powered on"
+            run "clear remote state" rm -f "$REMOTE_SHUTDOWN_SUCCESS" "$REMOTE_SHUTDOWN_REQUESTED" "$REMOTE_SHUTDOWN_EPOCH"
+            return 0
+        fi
+        log_msg "Powering on $REMOTE_HOST via $IDRAC_HOST, attempt $attempt"
+        ipmi_idrac chassis power on >"$IPMI_QUIET" 2>&1 || true
+        sleep 10
+    done
+    log_msg "Could not confirm $REMOTE_HOST powered on; will retry on next watcher tick"
+    return 1
+}
+
+# ------------------------------------------------------------- deadlock -----
+
+# Fire-and-forget like the byteme power-off. A soft power-off is an ACPI button
+# press, which deadlock's systemd turns into a clean shutdown (slurmd, NFS).
+shutdown_deadlock_async() {
+    if [[ -f "$DEADLOCK_SHUTDOWN_SUCCESS" ]]; then
+        log_msg "deadlock already marked powered down by us"
+        return 0
+    fi
+    if ! deadlock_is_on; then
+        # Off already (the user's choice) or its BMC is unreachable: either way
+        # we did not turn it off, so we must not turn it on afterwards.
+        log_msg "deadlock is not reporting power on; leaving it alone"
+        return 0
+    fi
+    (
+        log_msg "Sending soft power-off to deadlock via BMC $DEADLOCK_BMC"
+        ipmi_deadlock chassis power soft >"$IPMI_QUIET" 2>&1 || true
+        if [[ "$DRY_RUN" == "1" ]]; then
+            log_msg "[DRY-RUN] would now poll $DEADLOCK_BMC for up to ${DEADLOCK_POWEROFF_CONFIRM_TIMEOUT}s, then hard power-off if unconfirmed"
+            exit 0
+        fi
+        local end=$((SECONDS + DEADLOCK_POWEROFF_CONFIRM_TIMEOUT))
+        while (( SECONDS < end )); do
+            if deadlock_is_off; then
+                touch "$DEADLOCK_SHUTDOWN_SUCCESS"
+                log_msg "deadlock confirmed powered off"
+                exit 0
+            fi
+            sleep 5
+        done
+        log_msg "deadlock soft power-off not confirmed; sending hard power off"
+        ipmi_deadlock chassis power off >"$IPMI_QUIET" 2>&1 || true
+        sleep 10
+        if deadlock_is_off; then
+            touch "$DEADLOCK_SHUTDOWN_SUCCESS"
+            log_msg "deadlock confirmed forced power-off"
+        else
+            log_msg "Could not confirm deadlock power-off"
+        fi
+    ) &
+    log_msg "deadlock power-off dispatched in background (pid $!)"
+}
+
+# Runs in the background so the restore state machine never waits on NFS.
+# DEADLOCK_RESTORE_PENDING stops each 15 s watcher tick starting another one.
+restore_deadlock_async() {
+    [[ -f "$DEADLOCK_SHUTDOWN_SUCCESS" ]] || return 0
+    if [[ -f "$DEADLOCK_RESTORE_PENDING" ]] && \
+       (( $(date +%s) - $(stat -c %Y "$DEADLOCK_RESTORE_PENDING") < DEADLOCK_NFS_WAIT_SECONDS + 300 )); then
+        return 0
+    fi
+    run "mark deadlock restore pending" touch "$DEADLOCK_RESTORE_PENDING"
+    (
+        local waited=0
+        if [[ "$DRY_RUN" != "1" ]]; then
+            while (( waited < DEADLOCK_NFS_WAIT_SECONDS )); do
+                # mgmt -> srv 2049 is blocked at the firebox; head sshd + settle instead.
+                timeout 3 bash -c "</dev/tcp/$SLERM_NFS_HOST/22" 2>/dev/null && { sleep 20; break; }
+                sleep 15
+                waited=$((waited + 15))
+            done
+        fi
+        if (( waited >= DEADLOCK_NFS_WAIT_SECONDS )); then
+            log_msg "slerm NFS ($SLERM_NFS_HOST) still down after ${waited}s; powering deadlock on anyway"
+        else
+            log_msg "slerm NFS answering after ${waited}s; powering deadlock on"
+        fi
+        local attempt
+        for attempt in 1 2 3 4 5; do
+            if deadlock_is_on; then
+                log_msg "deadlock is powered on"
+                run "clear deadlock state" rm -f "$DEADLOCK_SHUTDOWN_SUCCESS" "$DEADLOCK_RESTORE_PENDING"
+                exit 0
+            fi
+            ipmi_deadlock chassis power on >"$IPMI_QUIET" 2>&1 || true
+            [[ "$DRY_RUN" == "1" ]] && exit 0
+            sleep 10
+        done
+        log_msg "Could not confirm deadlock powered on; a later watcher tick will retry"
+        rm -f "$DEADLOCK_RESTORE_PENDING"
+    ) &
+    log_msg "deadlock power-on dispatched in background (pid $!)"
+}
+
+# --------------------------------------------------------------- events -----
+
+wait_before_powerfail_actions() {
+    local waited=0
+    local delay="$REMOTE_SHUTDOWN_DELAY"
+    [[ "$DRY_RUN" == "1" ]] && delay=0
+    if [[ "$REAL_TEST" == "1" ]]; then
+        log_msg "REAL RECOVERY TEST: bypassing utility-present cancellation and initial delay"
+        return 0
+    fi
+    local reading
+    while (( waited < delay )); do
+        reading="$(battery_state)"
+        case "$reading" in
+            utility*)
+                log_msg "Utility power restored during initial delay; cancelling power-fail actions"
+                run "clear powerfail marker" rm -f "$POWERFAIL_MARKER"
+                notify_slerm    # resume the jobs slerm froze at t=0
+                return 1 ;;
+            low*)
+                # Heavy load (inference) leaves no room for a blip filter.
+                log_msg "UPS already $reading; skipping the rest of the ${delay}s delay"
+                return 0 ;;
+        esac
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 0
+}
+
+disarmed() {
+    [[ "$DRY_RUN" == "1" || "$REAL_TEST" == "1" ]] && return 1
+    local until
+    until="$(cat "$DISARMED_UNTIL_FILE" 2>/dev/null || echo 0)"
+    [[ "$until" =~ ^[0-9]+$ ]] && (( until > $(date +%s) ))
+}
+
+# Tell the slerm orchestrator at once (it must not power machines on during a
+# power event); slerm-ups-push.timer repeats this every minute anyway.
+notify_slerm() {
+    [[ "$DRY_RUN" == "1" ]] && return 0
+    ( /usr/local/sbin/slerm-ups-push & ) >/dev/null 2>&1 || true
+}
+
+on_battery() {
+    notify_slerm
+    if disarmed; then
+        touch "$ONBATT_SUPPRESSED"
+        log_msg "UPS power failure detected but guardian is DISARMED until $(date -Is -d "@$(cat "$DISARMED_UNTIL_FILE")"); no shutdown actions"
+        return 0
+    fi
+    rm -f "$ONBATT_SUPPRESSED"
+    run "set powerfail marker" touch "$POWERFAIL_MARKER"
+    log_msg "UPS power failure detected (budget ${SHUTDOWN_DEADLINE_SECONDS}s)"
+    wait_before_powerfail_actions || return 0
+    shutdown_remote_host_async
+    shutdown_deadlock_async
+    shutdown_local_guests
+    if [[ "$REAL_TEST" == "1" && -f "$REAL_TEST_ABORT_FILE" ]]; then
+        log_msg "REAL RECOVERY TEST: skipping power-cap step and proceeding to recovery"
+        rm -f "$REAL_TEST_ABORT_FILE"
+        return 0
+    fi
+    enable_local_power_cap || true
+    log_msg "on_battery complete with $(seconds_left)s of budget remaining"
+}
+
+battery_runtime_min() {
+    timeout 10 pwrstat -status 2>/dev/null |
+        awk -F'[.]+ *' '/Remaining Runtime/ { gsub(/[^0-9]/, "", $2); print $2 }'  || true
+}
+
+# byteme is the biggest draw and powers off in the background. A reading taken
+# while it is still going down says "low" for a load that is about to vanish
+# (10-01: 68 %, 4 min with byteme on; 11 min once it was off), so wait for its
+# power-off to be confirmed - unless the battery is already critically low.
+# Returns 0 when it is off (or was never asked to go), 1 otherwise.
+wait_for_remote_poweroff() {
+    [[ -f "$REMOTE_SHUTDOWN_REQUESTED" && ! -f "$REMOTE_SHUTDOWN_SUCCESS" ]] || return 0
+    local end=$((SECONDS + REMOTE_POWEROFF_CONFIRM_TIMEOUT + 20)) rt
+    log_msg "Low battery: waiting for $REMOTE_HOST to finish powering off before judging the battery"
+    while (( SECONDS < end )); do
+        if [[ -f "$REMOTE_SHUTDOWN_SUCCESS" ]]; then
+            sleep 10    # let the UPS's runtime estimate catch up with the lower load
+            return 0
+        fi
+        power_is_utility && return 0
+        rt="$(battery_runtime_min)"
+        if [[ "$rt" =~ ^[0-9]+$ ]] && (( rt <= LOWBATT_CRITICAL_RUNTIME_MIN )); then
+            log_msg "Low battery: only ${rt} min left; not waiting for $REMOTE_HOST"
+            return 1
+        fi
+        sleep 5
+    done
+    log_msg "Low battery: $REMOTE_HOST power-off still unconfirmed; judging the battery as it is"
+    return 1
+}
+
+# Power came back while we were going down: stop, and leave the restore to the
+# watcher (it needs the power-fail marker, set below, and the lock we release
+# on exit). 10-01: utility returned mid-lowbatt and the halt went ahead anyway.
+utility_is_back() {
+    [[ "$DRY_RUN" == "1" ]] && return 1
+    power_is_utility || return 1
+    log_msg "Utility power is back; abandoning the low-battery halt, the watcher restores the estate"
+    return 0
+}
+
+start_protected_guests() {
+    local id
+    for id in $PROTECTED_VMS; do run "start protected VM $id" qm start "$id" || true; done
+    for id in $PROTECTED_LXC; do run "start protected CT $id" pct start "$id" || true; done
+}
+
+on_low_battery() {
+    local reading
+    reading="$(battery_state)"
+    if [[ "$reading" == low* ]] && [[ "$DRY_RUN" != "1" ]] && wait_for_remote_poweroff; then
+        reading="$(battery_state)"
+    fi
+    case "$reading" in
+        utility*)
+            log_msg "Low-battery signal but utility power is back ($reading); nothing to do"
+            [[ "$DRY_RUN" == "1" ]] || return 0 ;;
+        ok*)
+            log_msg "Low-battery signal but the UPS now reads $reading, likely a shed-load dip; not halting, the watcher re-checks every 15 s"
+            [[ "$DRY_RUN" == "1" ]] || return 0 ;;
+        *)
+            # low, or unreadable: pwrstatd said low and we cannot disprove it.
+            log_msg "Low-battery check: $reading" ;;
+    esac
+    run "set powerfail marker" touch "$POWERFAIL_MARKER"
+    log_msg "UPS low battery detected; going down now"
+    # The cap only slows the halt now: on 10-01 every qm/pct call took 11-21 s
+    # under it and lowbatt crawled for 5+ minutes.
+    disable_local_power_cap || true
+    shutdown_remote_host_async
+    shutdown_deadlock_async
+    shutdown_local_guests
+    force_stop_everything
+    utility_is_back && return 0
+    shutdown_protected_guests
+    if utility_is_back; then
+        start_protected_guests
+        return 0
+    fi
+    log_msg "Halting host"
+    run "halt host" /sbin/shutdown -h now "UPS battery low"
+}
+
+on_online() {
+    if [[ ! -f "$POWERFAIL_MARKER" ]]; then
+        # The estate is restored but deadlock's power-on did not stick.
+        restore_deadlock_async
+        return 0
+    fi
+    log_msg "Utility power restored"
+
+    local attempts=0
+    [[ -f "$RESTORE_ATTEMPTS_FILE" ]] && attempts="$(cat "$RESTORE_ATTEMPTS_FILE" 2>/dev/null || echo 0)"
+    attempts=$((attempts + 1))
+    run "record restore attempt" bash -c "echo $attempts > '$RESTORE_ATTEMPTS_FILE'"
+
+    disable_local_power_cap || true
+
+    local remote_ok=1
+    restore_remote_host || remote_ok=0
+
+    start_local_guests
+    restore_deadlock_async
+    notify_slerm
+
+    # Guests are back and the cap is off (or the BMC is unreachable, which we
+    # cannot fix by retrying). Only an unfinished remote power-on justifies
+    # another pass, and even that gives up rather than looping forever.
+    if (( remote_ok == 1 )); then
+        run "clear powerfail marker" rm -f "$POWERFAIL_MARKER" "$RESTORE_ATTEMPTS_FILE"
+        log_msg "Restore complete; cleared power-fail marker"
+    elif (( attempts >= RESTORE_MAX_ATTEMPTS )); then
+        run "clear powerfail marker" rm -f "$POWERFAIL_MARKER" "$RESTORE_ATTEMPTS_FILE"
+        log_msg "Restore incomplete after $attempts attempts; clearing marker anyway to stop the retry loop. Check $REMOTE_HOST manually."
+    else
+        log_msg "Restore incomplete (attempt $attempts/$RESTORE_MAX_ATTEMPTS); watcher will retry"
+    fi
+}
+
+usage() {
+    echo "Usage: $0 onbatt|online|lowbatt|battery"
+    echo "  battery: print utility|low|ok|unknown and the reading (read-only)"
+    echo "  UPS_GUARDIAN_DRY_RUN=1  print actions instead of performing them"
+    exit 1
+}
+
+main() {
+    case "${1:-}" in
+        onbatt|online|lowbatt) : ;;
+        battery) battery_state; exit 0 ;;
+        *) usage ;;
+    esac
+
+    if [[ "${UPS_GUARDIAN_LOCKED:-0}" != "1" ]]; then
+        local rc=0
+        case "$1" in
+            onbatt)
+                UPS_GUARDIAN_LOCKED=1 exec flock --close -w 30 "$LOCK_FILE" "$0" "$@" ;;
+            lowbatt)
+                UPS_GUARDIAN_LOCKED=1 flock --close -E 75 -w "$LOWBATT_LOCK_WAIT" "$LOCK_FILE" "$0" "$@" || rc=$?
+                (( rc == 75 )) || exit "$rc"
+                # Halting matters more than the lock now.
+                log_msg "Low battery: lock still held after ${LOWBATT_LOCK_WAIT}s; going ahead without it"
+                UPS_GUARDIAN_LOCKED=1 exec "$0" "$@" ;;
+            online)
+                UPS_GUARDIAN_LOCKED=1 exec flock --close -n "$LOCK_FILE" "$0" "$@" ;;
+        esac
+    fi
+
+    rotate_log_if_needed
+    DEADLINE_AT=$((SECONDS + SHUTDOWN_DEADLINE_SECONDS))
+
+    case "$1" in
+        onbatt)  on_battery ;;
+        online)  on_online ;;
+        lowbatt) on_low_battery ;;
+    esac
+}
+
+main "$@"

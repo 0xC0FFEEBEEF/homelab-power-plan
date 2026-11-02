@@ -1,0 +1,6 @@
+[Unit]
+Description=Push UPS state to the slerm orchestrator on slerm-head
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/slerm-ups-push

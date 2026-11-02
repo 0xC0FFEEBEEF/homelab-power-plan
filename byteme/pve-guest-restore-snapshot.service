@@ -1,0 +1,6 @@
+[Unit]
+Description=Record which guests are running (for pve-guest-restore)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pve-guest-restore snapshot

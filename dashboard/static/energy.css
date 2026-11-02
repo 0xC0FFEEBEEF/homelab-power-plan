@@ -1,0 +1,40 @@
+.energy-card{padding:24px 28px;margin-bottom:16px}
+.en-head-right{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.en-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px;margin-top:18px}
+.en-tile{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:16px 18px;display:flex;flex-direction:column;gap:5px;animation:en-in .45s ease both}
+.en-tile:nth-child(2){animation-delay:.08s}.en-tile:nth-child(3){animation-delay:.16s}
+@keyframes en-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.en-tile.en-now{border-color:#2a4a3b}.en-tile strong{font-size:30px;font-weight:700;letter-spacing:-.5px;color:var(--text)}
+.en-tile.en-now strong{color:var(--green)}.en-tile small{color:var(--muted);font-size:11.5px;line-height:1.45}
+.en-label{font-size:10px;letter-spacing:1.2px;color:var(--muted);font-weight:600}
+.en-prog{height:5px;border-radius:3px;background:#1a2129;overflow:hidden;margin:4px 0 2px;position:relative}
+.en-prog i{display:block;height:100%;background:linear-gradient(90deg,var(--green2),var(--green));position:relative;overflow:hidden}
+.en-prog i:after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);animation:en-sweep 2.8s ease-in-out infinite}
+@keyframes en-sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+.kpi-bump{animation:en-bump .5s ease}@keyframes en-bump{40%{transform:scale(1.06);filter:brightness(1.35)}}
+.en-bars-wrap{position:relative;margin-top:22px}
+.en-bars{display:flex;align-items:flex-end;gap:2px;height:110px;border-bottom:1px solid var(--line)}
+.en-bar{flex:1;height:100%;display:flex;align-items:flex-end;cursor:default;position:relative}
+.en-bar i{display:block;width:100%;border-radius:2px 2px 0 0;background:#2a323c;animation:en-grow .6s ease both;transform-origin:bottom}
+@keyframes en-grow{from{transform:scaleY(0)}to{transform:none}}
+.en-bar.prev i{background:#4a6d94}.en-bar.cur i{background:var(--green2)}.en-bar.today i{background:var(--green);box-shadow:0 0 10px rgba(100,230,163,.45)}
+.en-bar.est i{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.13) 0 3px,transparent 3px 6px)}
+.en-bar.edge:before{content:"";position:absolute;left:-2px;top:0;bottom:-4px;border-left:1px dashed #3a4552}
+.en-bar:hover i{filter:brightness(1.4)}
+.en-axis{display:flex;gap:2px;margin-top:5px}.en-axis span{flex:1;font-size:9.5px;color:var(--muted);white-space:nowrap;overflow:visible}
+.en-tip{position:absolute;top:-6px;width:180px;background:#0b0e12;border:1px solid #28313a;border-radius:6px;padding:6px 9px;font-size:11px;color:var(--text);pointer-events:none;opacity:0;transition:opacity .12s}
+.en-servers{margin-top:18px}.en-srv-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.en-srv{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:9px 13px;display:flex;gap:10px;align-items:baseline;font-size:12.5px}
+.en-srv b{font-weight:600}.en-srv span{color:var(--muted)}
+.en-notes{margin-top:14px;display:flex;flex-direction:column;gap:6px}.en-notes p{margin:0;font-size:11.5px;color:var(--muted);line-height:1.5}
+.en-notes p.warn{color:var(--amber)}
+.en-form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:8px;background:#0f1318}
+.en-form[hidden]{display:none}
+.en-form label{display:flex;flex-direction:column;gap:4px;font-size:10.5px;color:var(--muted)}
+.en-form input,.en-form select{background:#0b0e12;color:var(--text);border:1px solid #28313a;border-radius:6px;padding:6px 8px;font:inherit;font-size:12px;width:130px}
+.en-msg{font-size:11px;color:var(--muted)}
+.en-hist{margin-top:14px}.en-hist summary{cursor:pointer;font-size:12px;color:var(--muted)}
+.en-hist table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+.en-hist th{text-align:left;color:var(--muted);font-weight:600;font-size:10.5px;letter-spacing:.8px;padding:6px 8px;border-bottom:1px solid var(--line)}
+.en-hist td{padding:6px 8px;border-bottom:1px solid #171d24}
+@media(max-width:600px){.energy-card{padding:18px 16px}.en-tile strong{font-size:26px}.en-bars{height:90px}}

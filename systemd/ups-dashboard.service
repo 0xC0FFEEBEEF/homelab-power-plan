@@ -1,0 +1,19 @@
+[Unit]
+Description=ByteMe2 UPS telemetry dashboard
+After=network.target pwrstatd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ups-dashboard
+ExecStart=/usr/bin/python3 /opt/ups-dashboard/server.py
+Restart=on-failure
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/ups-dashboard.env
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Restart the guests that were running before this host went down
+# After pve-guests: at boot onboot guests start first; at shutdown our ExecStop
+# records the running set BEFORE pve-guests stops everything.
+After=pve-guests.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pve-guest-restore restore
+ExecStop=/usr/local/sbin/pve-guest-restore snapshot final
+TimeoutStartSec=20min
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
